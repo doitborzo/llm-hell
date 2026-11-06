@@ -30,7 +30,14 @@ class Settings(BaseSettings):
     # --- Application database (users, sessions, endpoints, telemetry) ---
     database_url: str = "postgresql+asyncpg://llmhell:llmhell@localhost:5432/llmhell"
 
-    use_mock_vllm: bool = True
+    # --- Model provider (OpenAI-compatible, e.g. OpenRouter) --------------
+    # On first boot, when no ModelEndpoint rows exist yet and model_api_key is
+    # set, the app registers an "Answer" endpoint (answer_model_id) and, when
+    # agent_model_id differs, a "Coder" endpoint - so a fresh database can
+    # answer immediately, with no manual `manage.py add-endpoint`. Replaces
+    # the old bundled mock-vLLM path.
+    model_api_base_url: str = "https://openrouter.ai/api/v1"
+    model_api_key: str = ""
 
     # --- Per-user credentials ---------------------------------------------
     # A Fernet key, and the only thing standing between a database dump and
@@ -254,6 +261,12 @@ class Settings(BaseSettings):
     # Google tool takes `email` as a required argument, because the server is
     # multi-account and has no notion of a default one.
     google_account_email: str = ""
+    # Restrict Drive search to one folder and everything under it. A folder
+    # NAME (resolved against the account, e.g. "On-prem AI") or a Drive folder
+    # id. Empty = search the whole Drive the account can see (the default).
+    # When set but the folder can't be resolved, Drive search returns nothing
+    # rather than falling back to the whole account.
+    google_drive_folder: str = ""
     # Drive search returns metadata only, with no body text, so an answer
     # built on it would have titles to cite and nothing to quote. This many
     # top hits get a second call to fetch their content. Each one is a round

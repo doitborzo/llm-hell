@@ -69,12 +69,14 @@ The original OpenAI-compatible metrics proxy is untouched and still serves
 
 ```bash
 cp .env.example .env
-# edit .env: at minimum set POSTGRES_PASSWORD and USE_MOCK_VLLM=true
-docker compose --profile dev up -d --build
+# edit .env: set POSTGRES_PASSWORD, and MODEL_API_KEY (an OpenRouter key)
+docker compose up -d --build
 ```
 
-`--profile dev` adds `mock-vllm`, a GPU-free stand-in for the answer model,
-so the whole pipeline works without a RunPod pod.
+On first boot the app auto-registers model endpoints from `MODEL_API_KEY` /
+`ANSWER_MODEL_ID` / `AGENT_MODEL_ID`, so a fresh database can answer with no
+manual `manage.py add-endpoint`. See [FRIEND_SETUP.md](FRIEND_SETUP.md) for a
+full walkthrough, including the Docker MTU fix Windows/WSL2 users need.
 
 Create an account:
 
@@ -86,12 +88,12 @@ Then open **http://localhost:3001** and sign in.
 
 | service | URL | notes |
 | --- | --- | --- |
-| web | http://localhost:3001 | the demo app |
-| api | http://localhost:8000 | `/api/*` and the `/v1/*` proxy |
-| grafana | http://localhost:3000 | unchanged; owns 3000, which is why web is on 3001 |
-| prometheus | http://localhost:9090 | |
+| web | http://localhost:3001 | the demo app (loopback-only) |
+| api | http://localhost:8000 | `/api/*` and the `/v1/*` proxy (loopback-only) |
 
-Migrations run automatically when `api` starts.
+Migrations run automatically when `api` starts. GitLab search and the
+Grafana/Prometheus monitoring stack are opt-in:
+`docker compose --profile optional up -d`.
 
 ---
 

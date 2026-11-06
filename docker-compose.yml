@@ -55,9 +55,12 @@ services:
     # app/services/mcp/registry.py.
     command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     ports:
-      # Not loopback-only: this is the OpenAI-compatible endpoint opencode on
-      # testers' machines talks to over the network.
-      - "8000:8000"
+      # Loopback-only. This exposes the OpenAI-compatible /v1 endpoint, which
+      # is backed by the deployment's own model API key - binding it to
+      # 0.0.0.0 would let anyone on the LAN spend that key. To let another
+      # machine (e.g. opencode) reach it, put it behind a reverse proxy with
+      # its own auth, or change this back to "8000:8000" deliberately.
+      - "127.0.0.1:8000:8000"
     extra_hosts:
       # Lets `manage.py add-endpoint --base-url http://host.docker.internal:PORT/v1`
       # reach an SSH -L tunnel to RunPod that terminates on this host (a
@@ -88,9 +91,10 @@ services:
     depends_on:
       - api
     ports:
-      # 3001 on the host because Grafana already owns 3000 and moving it
-      # would break existing bookmarks and the README for no gain.
-      - "3001:3000"
+      # Loopback-only, so the app isn't reachable from other machines on the
+      # network. 3001 on the host (3000 is taken by Grafana when the optional
+      # monitoring profile is up). Change to "3001:3000" to expose on the LAN.
+      - "127.0.0.1:3001:3000"
 
   # --- MCP servers ---------------------------------------------------------
   # Each searchable source is a separate MCP server the API talks to as a
@@ -104,6 +108,9 @@ services:
     # here, and it lacks every code-search tool.
     image: zereight050/gitlab-mcp
     restart: unless-stopped
+    # GitLab search is opt-in: `docker compose --profile optional up -d`.
+    # Not part of the default stack and seeds disabled without a token.
+    profiles: ["optional"]
     environment:
       STREAMABLE_HTTP: "true"
       HOST: "0.0.0.0"
@@ -262,6 +269,9 @@ services:
   prometheus:
     image: prom/prometheus:v2.55.1
     restart: unless-stopped
+    # Monitoring is opt-in: `docker compose --profile optional up -d`.
+    # Not part of the default stack.
+    profiles: ["optional"]
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prom_data:/prometheus
@@ -278,6 +288,9 @@ services:
   grafana:
     image: grafana/grafana:11.3.0
     restart: unless-stopped
+    # Monitoring is opt-in: `docker compose --profile optional up -d`.
+    # Not part of the default stack.
+    profiles: ["optional"]
     env_file: .env
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
@@ -291,15 +304,6 @@ services:
       - postgres
     ports:
       - "3000:3000"
-
-  mock-vllm:
-    build:
-      context: ./tools
-      dockerfile: Dockerfile.mock_vllm
-    restart: unless-stopped
-    profiles: ["dev"]
-    ports:
-      - "127.0.0.1:8001:8000"
 
 volumes:
   embeddings-cache:

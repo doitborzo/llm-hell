@@ -103,7 +103,9 @@ The server then writes:
 | account registry | `~/.config/google-workspace-mcp/accounts.json` |
 | refresh tokens | `~/.local/share/google-workspace-mcp/credentials/<slug>.json` |
 
-On Windows these are under `%APPDATA%` and `%LOCALAPPDATA%`.
+On Windows these are the same XDG paths under your home directory —
+`%USERPROFILE%\.config\google-workspace-mcp\` and
+`%USERPROFILE%\.local\share\google-workspace-mcp\` — **not** `%APPDATA%`.
 
 Verify before moving on — call `manage_drive` with:
 

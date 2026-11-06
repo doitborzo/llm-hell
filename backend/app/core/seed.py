@@ -1,9 +1,11 @@
 """Startup seeding.
 
-Mock vLLM endpoints are seeded only for local dev (USE_MOCK_VLLM=true).
-There's no first-admin-user bootstrapping here: users are created via
-`manage.py` (`create-user`, `set-password`), which talks to the database
-directly and doesn't need an existing session to do so.
+Model endpoints are registered from the provider settings in `.env`
+(`model_api_key`, `model_api_base_url`, `answer_model_id`, `agent_model_id`)
+on first boot, so a fresh database can answer without a manual
+`manage.py add-endpoint`. There's no first-admin-user bootstrapping here:
+users are created via `manage.py` (`create-user`, `set-password`), which
+talks to the database directly and doesn't need an existing session to do so.
 
 Source rows ARE seeded unconditionally, because they are configuration
 rather than data - the four searchable surfaces are a property of the
@@ -52,8 +54,7 @@ _DEFAULT_SOURCES: dict[str, tuple[str, str, float, str | None]] = {
 
 async def run_seed() -> None:
     async with SessionLocal() as db:
-        if settings.use_mock_vllm:
-            await _seed_mock_endpoints(db)
+        await _seed_model_endpoints_from_env(db)
         await _seed_sources(db)
         await db.commit()
 
@@ -129,28 +130,44 @@ async def _seed_sources(db) -> None:
                 )
 
 
-async def _seed_mock_endpoints(db) -> None:
+async def _seed_model_endpoints_from_env(db) -> None:
+    """Register model endpoints from the provider settings in `.env`, once.
+
+    No-op when an endpoint already exists, or when no API key or answer model
+    is configured. A fresh database with `model_api_key` and `answer_model_id`
+    set comes up able to answer immediately. The answer model is registered in
+    `json_protocol` tools mode and, when `agent_model_id` names a different
+    model for @coder, that one is registered in `native` tools mode.
+    """
+    if not settings.model_api_key or not settings.answer_model_id:
+        return
     existing = (await db.execute(select(func.count()).select_from(ModelEndpoint))).scalar_one()
     if existing > 0:
         return
 
-    planner = ModelEndpoint(
-        name="GLM 4.7 (mock planner)",
-        base_url="http://mock-vllm:8000/v1",
-        model_id="glm-4.7",
-        role="planner",
+    answer = ModelEndpoint(
+        name="Answer",
+        base_url=settings.model_api_base_url,
+        api_key=settings.model_api_key,
+        model_id=settings.answer_model_id,
+        role="answer",
         ctx_window=131072,
         tools_mode="json_protocol",
         reasoning_profile=DEFAULT_REASONING_PROFILE,
     )
-    executor = ModelEndpoint(
-        name="GLM 4.7 Flash (mock executor)",
-        base_url="http://mock-vllm:8000/v1",
-        model_id="glm-4.7-flash",
-        role="executor",
-        ctx_window=131072,
-        tools_mode="json_protocol",
-        reasoning_profile=DEFAULT_REASONING_PROFILE,
-    )
-    db.add_all([planner, executor])
-    logger.info("Seeded mock vLLM endpoints for local development")
+    db.add(answer)
+    seeded = [settings.answer_model_id]
+    if settings.agent_model_id and settings.agent_model_id != settings.answer_model_id:
+        coder = ModelEndpoint(
+            name="Coder",
+            base_url=settings.model_api_base_url,
+            api_key=settings.model_api_key,
+            model_id=settings.agent_model_id,
+            role="executor",
+            ctx_window=131072,
+            tools_mode="native",
+            reasoning_profile=DEFAULT_REASONING_PROFILE,
+        )
+        db.add(coder)
+        seeded.append(settings.agent_model_id)
+    logger.info("Seeded model endpoints from .env: %s", ", ".join(seeded))

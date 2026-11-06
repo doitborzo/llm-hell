@@ -118,6 +118,19 @@ _DRIVE_MAX_TERMS = 4
 # than a round-trip one, and can afford to be the same as Drive's.
 _GMAIL_MAX_TERMS = 4
 
+# How long a resolved folder scope (a folder id and its subfolders' ids) is
+# reused before being looked up again. A shared folder's structure does not
+# change between two searches a few minutes apart.
+_FOLDER_SCOPE_TTL = 600.0
+# A bare Drive id is URL-safe base64, no spaces, and comfortably long; a
+# human folder name ("On-prem AI") has spaces or is short. Used to decide
+# whether GOOGLE_DRIVE_FOLDER is an id to use directly or a name to resolve.
+_DRIVE_FOLDER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,}$")
+
+
+def _looks_like_drive_id(value: str) -> bool:
+    return bool(_DRIVE_FOLDER_ID_RE.match(value.strip()))
+
 
 def drive_query(text: str) -> str:
     """Turn a user's words into a Drive API query.
@@ -827,6 +840,11 @@ class GoogleWorkspaceConnector:
         # searches a second apart do not both render the same pages.
         self._transcribing: set[str] = set()
         self._tasks: set[asyncio.Task[None]] = set()
+        # Resolved GOOGLE_DRIVE_FOLDER scope: the target folder's id and every
+        # subfolder's id, with the monotonic time it was resolved. None means
+        # "not resolved yet". Cached for _FOLDER_SCOPE_TTL.
+        self._folder_scope_ids: list[str] | None = None
+        self._folder_scope_at: float = 0.0
 
     @property
     def _account(self) -> str | None:
@@ -992,17 +1010,111 @@ class GoogleWorkspaceConnector:
             report["warning"] = f"the server does not expose {self._tool}"
         return report
 
+    async def _folder_parent_ids(self, ctx: "SearchContext | None") -> list[str] | None:
+        """Folder ids to scope Drive search to: the GOOGLE_DRIVE_FOLDER target
+        and every subfolder beneath it.
+
+        Returns None when no folder is configured (don't scope). Returns a list
+        of ids when one is - possibly empty, which means "configured but not
+        found", and the caller must then return nothing rather than search the
+        whole account. Cached for _FOLDER_SCOPE_TTL.
+        """
+        target = (self._settings.google_drive_folder or "").strip()
+        if not target:
+            return None
+        now = time.monotonic()
+        if self._folder_scope_ids is not None and (now - self._folder_scope_at) < _FOLDER_SCOPE_TTL:
+            return self._folder_scope_ids
+
+        base = self._base_args(ctx)
+
+        async def _subfolders(drive_query_text: str) -> list[SearchHit]:
+            raw = await self._call(
+                self._tool,
+                {**base, "operation": "search", "query": drive_query_text, "maxResults": MAX_RESULTS},
+            )
+            return drive_hits_from_markdown(raw.text, source_key=self.key, debug=False)
+
+        # Resolve the root. An id is used directly; a name is matched against
+        # the account's folders (exact title preferred, else the first match).
+        if _looks_like_drive_id(target):
+            roots = [target]
+        else:
+            found = await _subfolders(
+                f"name = '{escape_drive_term(target)}' "
+                "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+            )
+            roots = [h.external_id for h in found if h.external_id and h.title == target] or [
+                h.external_id for h in found if h.external_id
+            ]
+
+        # Walk the subtree one level per query - Drive has no recursive-parent
+        # operator. Bounded so a pathological tree can't fan out forever.
+        ids: list[str] = []
+        seen: set[str] = set()
+        queue = [fid for fid in roots if fid]
+        while queue and len(ids) < 500:
+            fid = queue.pop()
+            if fid in seen:
+                continue
+            seen.add(fid)
+            ids.append(fid)
+            try:
+                children = await _subfolders(
+                    f"'{escape_drive_term(fid)}' in parents "
+                    "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+                )
+            except Exception as exc:  # noqa: BLE001 - a missing level just narrows the scope
+                logger.warning("subfolder walk under %s failed: %s", fid, summarise_exception(exc))
+                continue
+            for child in children:
+                if child.external_id and child.external_id not in seen:
+                    queue.append(child.external_id)
+
+        self._folder_scope_ids = ids
+        self._folder_scope_at = now
+        if ids:
+            logger.info("Drive search scoped to folder %r: %d folder(s)", target, len(ids))
+        else:
+            logger.warning(
+                "GOOGLE_DRIVE_FOLDER=%r matched no folder for %s; Drive search returns nothing until it does",
+                target,
+                base.get("email"),
+            )
+        return ids
+
     async def search(self, query: str, *, limit: int, ctx: SearchContext) -> SourceResult:
         started = time.monotonic()
         result = SourceResult(source_key=self.key)
 
         is_drive = self.key == SOURCE_GOOGLE_DRIVE
 
+        # When a Drive folder scope is configured, resolve it first and refuse
+        # to search outside it. Resolution failure fails closed (no hits), not
+        # open (whole account) - the point of the setting is the restriction.
+        if is_drive and (self._settings.google_drive_folder or "").strip():
+            try:
+                folder_ids = await self._folder_parent_ids(ctx)
+            except Exception as exc:  # noqa: BLE001 - isolation is the contract
+                logger.warning("Drive folder-scope resolution failed: %s", summarise_exception(exc))
+                folder_ids = []
+            if not folder_ids:
+                result.error = (
+                    f"Drive search is scoped to folder {self._settings.google_drive_folder!r}, "
+                    "which could not be found for this account"
+                )
+                result.elapsed_ms = int((time.monotonic() - started) * 1000)
+                return result
+            scope_clause = " or ".join(f"'{escape_drive_term(fid)}' in parents" for fid in folder_ids)
+            drive_q = f"({drive_query(query)}) and ({scope_clause})"
+        else:
+            drive_q = drive_query(query)
+
         try:
             arguments = {
                 **self._base_args(ctx),
                 "operation": "search",
-                "query": drive_query(query) if is_drive else gmail_query(query),
+                "query": drive_q if is_drive else gmail_query(query),
                 "maxResults": min(limit, MAX_RESULTS),
             }
             raw = await self._call(self._tool, arguments)
@@ -1038,8 +1150,11 @@ class GoogleWorkspaceConnector:
         # asking for `UART3` returned nothing while the pad was legible on
         # page three. Pages this app has transcribed are searched here, and
         # any document Drive missed is added to the list.
+        # Skipped when a folder scope is set: the index can hold pages from
+        # documents outside the folder (e.g. transcribed before scoping was
+        # turned on), and surfacing those would defeat the restriction.
         from_index = 0
-        if is_drive:
+        if is_drive and not (self._settings.google_drive_folder or "").strip():
             try:
                 from_index = await self._add_index_hits(hits, query=query, limit=limit, ctx=ctx, debug=ctx.debug)
             except Exception as exc:  # noqa: BLE001 - a local index is an addition, never the result
